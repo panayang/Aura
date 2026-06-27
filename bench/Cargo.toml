@@ -1,0 +1,18 @@
+[package]
+name = "rust-hpc-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+ndarray = { path = "../../ndarray" }
+
+[profile.release]
+opt-level = 3
+lto = false
+panic = "unwind"
+codegen-units = 1
+debug = true

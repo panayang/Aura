@@ -164,6 +164,103 @@ the top of the file.
   it handle multi-index GEPs and non-canonical/nested induction variables
   uniformly instead of needing separate matching code for each IR shape.
 
+## Benchmark results
+
+`bench/` is a standalone crate (depends on `ndarray` via a path dependency)
+with four functions chosen to exercise each pass against real, not
+hand-written, codegen:
+
+- `zip_clean` -- idiomatic `Zip`-based elementwise add. **Control**: none of
+  the anti-patterns these passes target are present, so this should show
+  no effect either way.
+- `naive_indexed_add` -- the same computation via `a[[i, j]]` indexing
+  instead of iterators (targets GEPStrengthReduction, and
+  BoundsCheckElimination since these indices are always in range).
+- `scratch_buffer_kernel` -- a fixed-size `Vec` scratch buffer allocated
+  fresh every outer-loop iteration, used only locally (targets
+  HeapToStackPromotion -- this is the `output.s` pattern).
+- `noisy_kernel` -- a hot summation loop followed unconditionally by an
+  `eprintln!` the compiler can't prove is unreachable (targets
+  ColdPathOutlining).
+
+Methodology: `cargo rustc --release -- --emit=llvm-ir` to get the
+post-rustc-`-O3` IR, run it through `RustHpcOpt` with the full pass
+pipeline, recompile both the untouched and the transformed IR to object
+files with `llc -O3`, and re-link each against the *same* dependency
+rlibs and allocator-shim object `cargo`'s own build produced (substituting
+only the one recompiled object file into the real link command `rustc
+--print link-args` reports) -- so the comparison isolates exactly what
+these passes change, not differences in how the two were linked.
+
+Each binary times its own functions in-process (`std::time::Instant`,
+`std::hint::black_box`-guarded, 2000 iterations after a warmup). Medians
+of 5 runs each on this machine:
+
+| Function | Baseline | With passes | Δ |
+|---|---|---|---|
+| `zip_clean` (control) | 13970 ns/iter | 12629 ns/iter | within noise -- see below |
+| `naive_indexed_add` | 16545 ns/iter | 16268 ns/iter | no measurable difference |
+| `scratch_buffer_kernel` | 31066 ns/iter | 21324 ns/iter | **-31.4%**, every optimized run faster than every baseline run |
+| `noisy_kernel` | 85280 ns/iter | 85427 ns/iter | no measurable difference |
+
+Take the control row seriously: run-to-run variance on this machine is
+large enough (roughly ±15-20%) that `zip_clean` -- which nothing here
+touches -- shows a similar-sized swing to `naive_indexed_add` and
+`noisy_kernel`. Those two passes' effects on *this* benchmark are real
+(verified directly on the IR, see below) but too small relative to this
+machine's noise floor to show up reliably in wall-clock timing; that's a
+property of this benchmark and this machine, not evidence the IR-level
+change is a no-op. `scratch_buffer_kernel`'s improvement, by contrast, is
+clearly outside the noise floor: it isn't close.
+
+### What benchmarking against real code found, that hand-written tests didn't
+
+Three real bugs surfaced only once these passes ran against actual
+`rustc`+`ndarray` output instead of hand-written `.ll` test cases, each now
+fixed and explained in the relevant pass's comments:
+
+- **HeapToStackPromotion matched nothing at all.** Every real rustc
+  allocation is immediately followed by an OOM check branching to
+  `alloc::raw_vec::handle_error()` then `unreachable`; the forward
+  reachability search was treating *any* path to `unreachable` without a
+  matching dealloc as a leak, the same as an actual `ret`. Since this
+  branch exists after literally every allocation, the pass could never
+  promote a single real one. Fixed: reaching `unreachable` is not a leak
+  there's no memory to free on a path that never executes.
+- **The allocator name table never matched real symbols.** `__rust_alloc`
+  and `__rust_dealloc` are real Rust items, not plain `extern "C"`
+  functions, so rustc mangles them (`_RNvCseyyhC5cu0IB_7___rustc14___rust_dealloc`),
+  not the literal `__rust_dealloc` the original exact-match table expected.
+  Fixed with substring matching for the Rust-mangled entries specifically
+  (Rust's mangling keeps identifier text verbatim, just length-prefixed,
+  so the bare name is always a literal substring) -- while keeping exact
+  matching for the genuinely unmangled `HeapAlloc`/`HeapFree`/`malloc`/`free`,
+  since substring-matching something as short as `"free"` risks false
+  positives like `freeze_buffer`.
+- **BoundsCheckElimination's allowlist only knew core's panic function.**
+  `ndarray`'s `Index`/`IndexMut` impls call their own
+  `ndarray::arraytraits::array_out_of_bounds()`, not
+  `core::panicking::panic_bounds_check`, and take *no* arguments (so the
+  operand cross-check that's the pass's strongest verification can't
+  apply -- documented as an explicit, narrower fallback for that specific
+  function rather than silently). It also guards multi-dimensional
+  indexing with `and i1 %row_in_bounds, %col_in_bounds`, not a bare
+  `icmp`, which the pass didn't decompose. Both fixed; verified eliminating
+  100% (2/2) of real `array_out_of_bounds` guards in `naive_indexed_add`
+  at `-O1`.
+
+That `-O1` qualifier on the last point matters: at full `-O3`, the same
+function shows **0 of 4** guards eliminated, not because the fix is wrong
+but because LLVM's loop vectorizer has already fused the original
+`index < len` guard into the loop's own induction-variable exit condition
+by the time this pass runs, leaving nothing in the simple
+"conjunction-of-comparisons" shape the pass looks for. This is the same
+reason LLVM's own `-irce` (Induction Range Check Elimination) pass is
+scheduled *before* the vectorizer in the standard pipeline rather than
+after -- BoundsCheckElimination needs the same treatment to be effective
+against fully-optimized loops, which this project's pipeline doesn't yet
+do (see Known limitations).
+
 ## Known limitations (by design, not oversight)
 
 - HeapToStackPromotion's reload-from-local-temporary match requires
@@ -180,3 +277,15 @@ the top of the file.
   attempt to estimate whether strength-reducing a given GEP is actually a
   net win versus what LSR would later do anyway; it strength-reduces every
   affine candidate unconditionally.
+- BoundsCheckElimination is not yet scheduled anywhere specific in a real
+  optimization pipeline -- this project only demonstrates it via
+  `RustHpcOpt -passes=...` standalone. Run after the loop vectorizer (e.g.
+  against full `-O3` IR, as in Benchmark results above) it has essentially
+  nothing left to match, since the vectorizer has already folded the
+  original guard into the loop's induction-variable exit condition. To be
+  effective on vectorized/unrolled loops it needs the same pipeline
+  position LLVM gives `-irce`: scheduled into the loop pass pipeline
+  *before* vectorization, not run as a late, standalone cleanup pass. Not
+  implemented here; this project's `RustHpcOpt` driver runs whatever
+  pipeline text you give it once, with no concept of "the loop pipeline"
+  as a scheduling point.

@@ -105,12 +105,29 @@ STATISTIC(NumHeapAllocsPromoted,
 namespace {
 
 /// Describes one allocator/deallocator ABI pair this pass knows how to
-/// promote. Matched by exact declared-function name -- these are all
-/// plain, unmangled C symbols (libstd's own `__rust_*` shim included), not
-/// Rust-mangled names, so no demangling is needed here unlike the other
-/// passes in this project.
+/// promote. Matched by substring against the declared function's name, not
+/// equality: `HeapAlloc`/`HeapFree`/`malloc`/`free` are genuine `extern "C"`
+/// symbols and appear verbatim, but libstd's own `__rust_alloc`-family shim
+/// functions are themselves Rust items and get Rust-mangled into something
+/// like `_RNvCseyyhC5cu0IB_7___rustc14___rust_dealloc` in real rustc output
+/// -- confirmed empirically (see bench/ and README.md) after an exact-match
+/// version of this table matched nothing in actual compiler output, only
+/// in hand-written test IR that declared these names literally. Rust's
+/// mangling is length-prefixed but keeps the identifier text verbatim
+/// (the "14" immediately before "__rust_dealloc" above is its length, 14
+/// characters), so a substring search still finds it reliably without
+/// needing to demangle. `__rust_alloc_zeroed`'s mangled form also contains
+/// the substring "__rust_alloc", so it's listed first below -- matching
+/// stops at the first hit, and AllocatorPairs is in match-priority order.
+///
+/// `HeapAlloc`/`HeapFree`/`malloc`/`free` are genuine `extern "C"` symbols,
+/// never Rust-mangled, so they're matched by exact equality instead
+/// (`NameIsMangled = false`): `free` in particular is short and generic
+/// enough that substring-matching it could false-positive on an unrelated
+/// function whose name happens to contain "free" (e.g. `freeze_buffer`).
 struct AllocatorPair {
   StringRef AllocName;
+  bool NameIsMangled;
   int SizeArgIdx;
   int AlignArgIdx; // -1 if the ABI doesn't expose one.
   bool Zeroed;
@@ -120,17 +137,21 @@ struct AllocatorPair {
 
 constexpr AllocatorPair AllocatorPairs[] = {
     // libstd's portable allocator shim; size/align in usize args 0/1.
-    {"__rust_alloc_zeroed", 0, 1, true, "__rust_dealloc", 0},
-    {"__rust_alloc", 0, 1, false, "__rust_dealloc", 0},
+    {"__rust_alloc_zeroed", true, 0, 1, true, "__rust_dealloc", 0},
+    {"__rust_alloc", true, 0, 1, false, "__rust_dealloc", 0},
     // Win32, when the alloc wrapper itself didn't survive as a named call
     // but HeapAlloc/HeapFree did (as seen in this project's output.s).
-    {"HeapAlloc", 2, -1, false, "HeapFree", 2},
+    {"HeapAlloc", false, 2, -1, false, "HeapFree", 2},
     // libc, for Linux/other Unix targets where libstd's allocator bottoms
     // out here instead.
-    {"malloc", 0, -1, false, "free", 0},
+    {"malloc", false, 0, -1, false, "free", 0},
 };
 
 constexpr unsigned DefaultAllocaAlignment = 16;
+
+bool nameMatches(StringRef DeclaredName, StringRef Target, bool IsMangled) {
+  return IsMangled ? DeclaredName.contains(Target) : DeclaredName == Target;
+}
 
 /// Returns the AllocatorPair matching `CI`'s callee, or nullptr.
 const AllocatorPair *matchAllocCall(CallInst *CI) {
@@ -138,7 +159,7 @@ const AllocatorPair *matchAllocCall(CallInst *CI) {
   if (!Callee || !Callee->isDeclaration())
     return nullptr;
   for (const AllocatorPair &Pair : AllocatorPairs)
-    if (Callee->getName() == Pair.AllocName)
+    if (nameMatches(Callee->getName(), Pair.AllocName, Pair.NameIsMangled))
       return &Pair;
   return nullptr;
 }
@@ -277,7 +298,8 @@ SmallVector<DeallocMatch, 2> findDeallocCalls(Function &F, CallInst *AllocCI,
     if (!CI)
       continue;
     Function *Callee = CI->getCalledFunction();
-    if (!Callee || Callee->getName() != Pair.DeallocName)
+    if (!Callee ||
+        !nameMatches(Callee->getName(), Pair.DeallocName, Pair.NameIsMangled))
       continue;
     PointerResolution Resolution = resolvePointerToAlloc(
         CI->getArgOperand(Pair.DeallocPtrArgIdx), AllocCI, CI, DT);
@@ -288,11 +310,22 @@ SmallVector<DeallocMatch, 2> findDeallocCalls(Function &F, CallInst *AllocCI,
 }
 
 /// True if every path forward from `AllocCI` reaches one of `Deallocs`
-/// before either reaching a return/unreachable terminator (a leak) or
-/// looping back around to `AllocCI`'s own block (meaning `AllocCI` could
-/// execute again before this allocation's instance was ever freed -- not
-/// something well-formed Rust alloc/dealloc pairing should produce, so
-/// conservatively rejected rather than reasoned about further).
+/// before either reaching a `ret` without freeing (a leak) or looping back
+/// around to `AllocCI`'s own block (meaning `AllocCI` could execute again
+/// before this allocation's instance was ever freed -- not something
+/// well-formed Rust alloc/dealloc pairing should produce, so conservatively
+/// rejected rather than reasoned about further).
+///
+/// Reaching `unreachable` without a dealloc first is *not* treated as a
+/// leak: every real allocation rustc emits is immediately followed by an
+/// allocator-failure check that branches straight to
+/// `alloc::raw_vec::handle_error()` then `unreachable` -- there is no
+/// memory to free on that path because the allocation never happened.
+/// Treating `unreachable` the same as `ret` here would mean this pass could
+/// never promote a single real-world Rust allocation, which is exactly
+/// what an early version of this pass got wrong before being checked
+/// against actual rustc-emitted IR (see bench/ and README.md) instead of
+/// only hand-written test cases.
 ///
 /// This single forward search handles any number of dealloc sites
 /// uniformly: each one simply ends the search along whichever paths reach
@@ -325,7 +358,9 @@ bool pathsAllReachOneDealloc(CallInst *AllocCI,
       if (auto *CI = dyn_cast<CallInst>(I); CI && DeallocSet.contains(CI))
         goto handled;
       if (I->isTerminator()) {
-        if (isa<ReturnInst>(I) || isa<UnreachableInst>(I))
+        if (isa<UnreachableInst>(I))
+          goto handled; // No memory to free on a path that never executes.
+        if (isa<ReturnInst>(I))
           return false; // Reached a function exit without freeing.
         bool LoopedBack = false;
         pushSuccessors(I->getParent(), LoopedBack);

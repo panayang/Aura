@@ -74,21 +74,56 @@ STATISTIC(NumBoundsChecksEliminated,
 
 namespace {
 
-/// True if the (demangled) name of a Rust core panicking function is
-/// specifically the bounds-check one. Kept as an explicit allowlist rather
+/// Bounds-check panic functions this pass recognizes by name, and whether
+/// that function's call site can be expected to carry the index/length as
+/// real arguments (enabling the operand cross-check in
+/// conditionMatchesCallArguments) or not.
+///
+/// `core::panicking::panic_bounds_check` takes `(index, len, location)`, so
+/// the cross-check applies. `ndarray::arraytraits::array_out_of_bounds` --
+/// found empirically while benchmarking against real ndarray code (see
+/// bench/ and README.md), not anticipated up front -- takes *no* arguments
+/// at all, so there is nothing for that cross-check to compare against; for
+/// that function the verification falls back to the structural check alone
+/// (single-predecessor guard block, `noreturn` call, `unreachable`
+/// terminator). That's a real reduction in how independently this specific
+/// allowlist entry is verified, called out explicitly rather than silently
+/// -- it's accepted because the function's only possible caller-visible
+/// purpose, given its name and crate, is exactly this guard.
+struct BoundsCheckPanicFn {
+  StringRef Name;
+  bool HasIndexLenArgs;
+};
+
+constexpr BoundsCheckPanicFn BoundsCheckPanicFns[] = {
+    {"core::panicking::panic_bounds_check", true},
+    {"ndarray::arraytraits::array_out_of_bounds", false},
+};
+
+/// Returns the matching BoundsCheckPanicFn for the (demangled) name of a
+/// panicking function, or nullptr. Kept as an explicit allowlist rather
 /// than a substring search for "panic" so that unrelated panics (explicit
 /// user panics, `.unwrap()`/`.expect()` failures, assertion failures,
 /// arithmetic-overflow panics, etc.) are never touched.
-bool isBoundsCheckPanicFunction(StringRef MangledName) {
+const BoundsCheckPanicFn *matchBoundsCheckPanicFunction(StringRef MangledName) {
   std::string Demangled = demangle(MangledName);
   StringRef D(Demangled);
-  // v0 and legacy mangling both demangle to this same path; check the raw
-  // mangled name too in case `demangle()` fails to recognize a mangling
-  // scheme variant (defensive -- legacy Rust mangling is a thin wrapper
-  // around Itanium and should always demangle, but symbol mangling has
-  // changed across rustc versions before).
-  return D.contains("core::panicking::panic_bounds_check") ||
-         MangledName.contains("panic_bounds_check");
+  for (const BoundsCheckPanicFn &Fn : BoundsCheckPanicFns) {
+    // The full `a::b::c` path, checked against the demangled name.
+    if (D.contains(Fn.Name))
+      return &Fn;
+    // Bare last-component fallback (e.g. "panic_bounds_check" alone)
+    // checked against the *raw* mangled name, in case `demangle()` fails
+    // to recognize a mangling scheme variant -- legacy Rust mangling is a
+    // thin wrapper around Itanium and should always demangle, but symbol
+    // mangling has changed across rustc versions before, and Rust's
+    // mangling keeps identifier text verbatim (just length-prefixed) so
+    // the bare name still appears as a literal substring either way.
+    StringRef BareName = Fn.Name.substr(Fn.Name.rfind("::") + 2);
+    if (MangledName.contains(BareName))
+      return &Fn;
+  }
+  return nullptr;
 }
 
 /// Returns the sole "interesting" call in `BB`, if `BB` is purely a panic
@@ -142,19 +177,61 @@ bool matchesModuloIntCast(Value *V, Value *Arg) {
   return false;
 }
 
-/// True if the icmp's two operands are, as a set, the same two values
-/// (modulo int casts) as two of the call's arguments -- i.e. this
-/// comparison and this call are talking about the same index/length pair.
-bool conditionMatchesCallArguments(ICmpInst *Cmp, CallInst *Call) {
-  Value *C0 = Cmp->getOperand(0), *C1 = Cmp->getOperand(1);
-  bool Found0 = false, Found1 = false;
-  for (Value *Arg : Call->args()) {
-    if (!Found0 && matchesModuloIntCast(C0, Arg))
-      Found0 = true;
-    else if (!Found1 && matchesModuloIntCast(C1, Arg))
-      Found1 = true;
+/// Decomposes `V` into the `icmp`s it's an `and` of, e.g. ndarray's
+/// multi-dimensional `Index` impl checks each dimension separately and
+/// combines them with `and i1 %row_in_bounds, %col_in_bounds` rather than a
+/// single comparison -- found empirically (see bench/ and README.md) after
+/// a version of this pass that only ever recognized a bare `icmp` matched
+/// nothing in real ndarray-generated IR. Sets `Valid` to false (rejecting
+/// the branch entirely) if `V` contains anything other than `icmp`s and
+/// `and`s, e.g. a call result or an `or` -- this is meant to recognize "a
+/// conjunction of range checks", not arbitrary boolean conditions that
+/// merely happen to lead to a recognized panic call.
+void collectIcmpLeaves(Value *V, SmallVectorImpl<ICmpInst *> &Leaves,
+                       bool &Valid) {
+  if (auto *Cmp = dyn_cast<ICmpInst>(V)) {
+    Leaves.push_back(Cmp);
+    return;
   }
-  return Found0 && Found1;
+  if (auto *BO = dyn_cast<BinaryOperator>(V);
+      BO && BO->getOpcode() == Instruction::And) {
+    collectIcmpLeaves(BO->getOperand(0), Leaves, Valid);
+    collectIcmpLeaves(BO->getOperand(1), Leaves, Valid);
+    return;
+  }
+  Valid = false;
+}
+
+/// True if at least two of the call's arguments (e.g. index and len out of
+/// `panic_bounds_check(index, len, location)` -- the `location` argument is
+/// never expected to match anything and that's fine) appear, modulo int
+/// casts, as operands somewhere across the conjunction's comparisons. This
+/// is the same "at least the index/len pair line up" bar the original
+/// single-`icmp` version of this check used, generalized to a conjunction
+/// of several comparisons (see collectIcmpLeaves) instead of just one.
+/// Each operand can satisfy at most one call argument, so a degenerate
+/// repeated operand can't trivially satisfy more than its share.
+bool conditionMatchesCallArguments(ArrayRef<ICmpInst *> Leaves,
+                                    CallInst *Call) {
+  SmallVector<Value *, 8> Operands;
+  for (ICmpInst *Cmp : Leaves) {
+    Operands.push_back(Cmp->getOperand(0));
+    Operands.push_back(Cmp->getOperand(1));
+  }
+  SmallPtrSet<Value *, 8> UsedOperands;
+  unsigned MatchedArgs = 0;
+  for (Value *Arg : Call->args()) {
+    for (Value *Op : Operands) {
+      if (UsedOperands.contains(Op))
+        continue;
+      if (matchesModuloIntCast(Op, Arg)) {
+        UsedOperands.insert(Op);
+        ++MatchedArgs;
+        break;
+      }
+    }
+  }
+  return MatchedArgs >= 2;
 }
 
 /// If `Br`'s condition guards a call to panic_bounds_check on one side,
@@ -163,22 +240,41 @@ bool conditionMatchesCallArguments(ICmpInst *Cmp, CallInst *Call) {
 bool tryEliminateGuard(BranchInst *Br) {
   if (!Br->isConditional())
     return false;
-  auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
-  if (!Cmp)
+  SmallVector<ICmpInst *, 4> CmpLeaves;
+  bool ValidCondition = true;
+  collectIcmpLeaves(Br->getCondition(), CmpLeaves, ValidCondition);
+  if (!ValidCondition || CmpLeaves.empty())
     return false;
 
   for (unsigned K = 0; K != 2; ++K) {
     BasicBlock *PanicBB = Br->getSuccessor(K);
     BasicBlock *SafeBB = Br->getSuccessor(1 - K);
-    if (PanicBB == SafeBB || !PanicBB->hasNPredecessors(1))
+    if (PanicBB == SafeBB)
       continue;
+    // Deliberately not requiring PanicBB to have a single predecessor:
+    // found empirically (see bench/ and README.md) that LLVM commonly
+    // merges several distinct bounds-check failure paths -- e.g. separate
+    // checks for `a[[i,j]]`, `b[[i,j]]`, `out[[i,j]]` -- into one shared
+    // tail block when the panic call takes no arguments to distinguish
+    // them (as ndarray's array_out_of_bounds doesn't). Soundness doesn't
+    // depend on this block having one predecessor: for a panic call that
+    // does carry index/length arguments, conditionMatchesCallArguments
+    // below independently proves *this* Br is a guard for *this* call's
+    // fixed, static operands regardless of how many other branches also
+    // happen to share the block; for one that doesn't (see
+    // BoundsCheckPanicFn::HasIndexLenArgs), the verification is already
+    // documented as resting on structure and name alone, which doesn't
+    // get any weaker just because other, independently-verified branches
+    // also lead here.
 
     CallInst *Call = getSolePanicCall(PanicBB);
     if (!Call)
       continue;
-    if (!isBoundsCheckPanicFunction(Call->getCalledFunction()->getName()))
+    const BoundsCheckPanicFn *Fn =
+        matchBoundsCheckPanicFunction(Call->getCalledFunction()->getName());
+    if (!Fn)
       continue;
-    if (!conditionMatchesCallArguments(Cmp, Call))
+    if (Fn->HasIndexLenArgs && !conditionMatchesCallArguments(CmpLeaves, Call))
       continue;
 
     LLVM_DEBUG(dbgs() << "rust-hpc-bce: eliminating bounds-check guard "
@@ -187,7 +283,8 @@ bool tryEliminateGuard(BranchInst *Br) {
 
     BranchInst::Create(SafeBB, Br->getIterator());
     Br->eraseFromParent();
-    RecursivelyDeleteTriviallyDeadInstructions(Cmp);
+    for (ICmpInst *Cmp : CmpLeaves)
+      RecursivelyDeleteTriviallyDeadInstructions(Cmp);
     ++NumBoundsChecksEliminated;
     return true;
   }
